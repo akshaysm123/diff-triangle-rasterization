@@ -1,2 +1,3 @@
 build/
 diff_triangle_rasterization.egg-info/
+*.tmp
