@@ -42,7 +42,7 @@ namespace cg = cooperative_groups;
 #include "backward.h"
 
 // Uncomment to log kernel launch sites to stderr.
-#define RASTERIZER_IMPL_DEBUG_LAUNCHES
+// #define RASTERIZER_IMPL_DEBUG_LAUNCHES
 
 #ifdef RASTERIZER_IMPL_DEBUG_LAUNCHES
 #define RASTERIZER_IMPL_LAUNCH_LOG(expr) do { std::cerr << expr << std::endl; } while (0)

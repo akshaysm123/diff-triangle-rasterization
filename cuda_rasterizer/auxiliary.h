@@ -35,6 +35,10 @@
 #define NORMAL_OFFSET 2 
 #define MIDDEPTH_OFFSET 5
 #define DISTORTION_OFFSET 6
+#define RANDOM_COLOR_OFFSET 7
+
+__device__ const float RANDOM_COLOR_SATURATION = 0.75f;
+__device__ const float RANDOM_COLOR_VALUE = 0.9f;
 
 __device__ const float near_n = 0.2;
 __device__ const float far_n = 100.0;
@@ -62,6 +66,40 @@ __device__ const float SH_C3[] = {
 };
 
 __forceinline__ __device__ float sumf3(float3 a){return a.x + a.y + a.z;}
+
+__forceinline__ __device__ float fract01(float x){
+	return x - floorf(x);
+}
+
+// Deterministic hue in [0, 1) from triangle index (golden-ratio spacing).
+__forceinline__ __device__ float random_hue(uint32_t idx){
+	return fract01((float)idx * 0.618033988749895f);
+}
+
+// H, S, V in [0, 1].
+__forceinline__ __device__ float3 hsv2rgb(float h, float s, float v){
+	h = fract01(h);
+	const float c = v * s;
+	const float hp = h * 6.0f;
+	const float x = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
+	const float m = v - c;
+	float3 rgb = { m, m, m };
+
+	if (hp < 1.0f)
+		rgb = { c + m, x + m, m };
+	else if (hp < 2.0f)
+		rgb = { x + m, c + m, m };
+	else if (hp < 3.0f)
+		rgb = { m, c + m, x + m };
+	else if (hp < 4.0f)
+		rgb = { m, x + m, c + m };
+	else if (hp < 5.0f)
+		rgb = { x + m, m, c + m };
+	else
+		rgb = { c + m, m, x + m };
+
+	return rgb;
+}
 
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {

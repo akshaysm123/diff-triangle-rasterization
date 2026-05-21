@@ -447,6 +447,7 @@ renderCUDA(
     uint32_t contributor = 0;
     uint32_t last_contributor = 0;
     float C[CHANNELS] = { 0 };
+    float C_random[3] = { 0 };
 
     // Added from 2DGS
     float N[3] = {0};
@@ -553,6 +554,14 @@ renderCUDA(
             for (int ch = 0; ch < CHANNELS; ch++)
                 C[ch] += features[j_id * CHANNELS + ch] * alpha * T;
 
+            const float3 random_rgb = hsv2rgb(
+                random_hue((uint32_t)j_id),
+                RANDOM_COLOR_SATURATION,
+                RANDOM_COLOR_VALUE);
+            C_random[0] += random_rgb.x * blending_weight;
+            C_random[1] += random_rgb.y * blending_weight;
+            C_random[2] += random_rgb.z * blending_weight;
+
             T = test_T;
 
             // Keep track of last range entry to update this
@@ -579,6 +588,8 @@ renderCUDA(
         for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
         out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
         out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+        for (int ch = 0; ch < 3; ch++)
+            out_others[pix_id + (RANDOM_COLOR_OFFSET + ch) * H * W] = C_random[ch] + T * bg_color[ch];
     }
 }
 
