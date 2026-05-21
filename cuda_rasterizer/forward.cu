@@ -123,6 +123,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
     bool prefiltered)
 {
 
+    // the kernel is launched with *at least* P threads, any excess threads exit
     auto idx = cg::this_grid().thread_rank();
     if (idx >= P)
         return;
@@ -130,9 +131,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
     // Initialize radius and touched tiles to 0. If this isn't changed,
     // this Triangle will not be processed further.
 
+    // offset to grab 3D vertex positions of triangle
     const int cumsum_for_triangle = cumsum_of_points_per_triangle[idx];
     const int offset = 3 * cumsum_for_triangle;
 
+    // zero intialization to track triangles that don't contribute
     radii[idx] = 0;
     tiles_touched[idx] = 0;
     scaling[idx] = 0.0f;
@@ -147,18 +150,22 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
     float3 center_triangle = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < num_points_per_triangle[idx]; i++) {
+        // indices is written here so the backward pass can recover the local vertex index
         indices[cumsum_for_triangle + i] = i;
         center_triangle.x += triangles_points[offset + 3 * i];
         center_triangle.y += triangles_points[offset + 3 * i + 1];
         center_triangle.z += triangles_points[offset + 3 * i + 2];
     }
 
+    // center as arihtmetic mean
     center_triangle.x /= num_points_per_triangle[idx];
     center_triangle.y /= num_points_per_triangle[idx];
     center_triangle.z /= num_points_per_triangle[idx];
 
     // Perform near culling, quit if outside.
     float3 p_view_triangle;
+    // (auxiliary.h) tansforms the centroid with viewmatrix to obtain centroid location in camera space `p_view_triangle`
+    // the triangle is discarded if the z-coord < near plane. 
     if (!in_frustum_triangle(idx, center_triangle, viewmatrix, projmatrix, prefiltered, p_view_triangle)){
         return;
     }
@@ -189,8 +196,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
         v1.z * v2.x - v1.x * v2.z,
         v1.x * v2.y - v1.y * v2.x
     );
+    // nonrmal vector to camera space
     cross_prod = transformVec4x3(cross_prod, viewmatrix);
 
+    // unit length
     float length_cross = __fsqrt_rn(cross_prod.x*cross_prod.x + cross_prod.y*cross_prod.y + cross_prod.z*cross_prod.z);
     length_cross = max(length_cross, 1e-4f);
     cross_prod.x /= length_cross;
@@ -198,23 +207,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
     cross_prod.z /= length_cross;
 
     normal_cvx = cross_prod;
-    // 2. Normalize the camera viewpoint direction
+
+    // normalize the camera viewpoint direction
     float length_viewpoint = __fsqrt_rn(p_view_triangle.x * p_view_triangle.x + 
         p_view_triangle.y * p_view_triangle.y + 
         p_view_triangle.z * p_view_triangle.z);
     length_viewpoint = max(length_viewpoint, 1e-4f);
 
+    // this is the unit vector from camera center to center of the triangle in camera space
     float3 normalized_camera_center;
     normalized_camera_center.x = p_view_triangle.x / length_viewpoint;
     normalized_camera_center.y = p_view_triangle.y / length_viewpoint;
     normalized_camera_center.z = p_view_triangle.z / length_viewpoint;
 
-    // 3. Compute cosine (before flipping the normal)
+    // Compute cosine (before flipping the normal)
     float cos_theta = normal_cvx.x * normalized_camera_center.x +
         normal_cvx.y * normalized_camera_center.y +
         normal_cvx.z * normalized_camera_center.z;
 
-    // 4. Flip the normal if needed (ensure it faces the camera)
+    // 4Flip the normal if needed (ensure it faces the camera)
     if (cos_theta > 0) {
         normal_cvx.x = -normal_cvx.x;
         normal_cvx.y = -normal_cvx.y;
@@ -222,30 +233,35 @@ __global__ void preprocessCUDA(int P, int D, int M,
         cos_theta = -cos_theta; 
     }
 
+    // if the triangle is edge-on to the camera
     const float threshold = 0.001f;
     if (fabsf(cos_theta) < threshold) {
         return;
     }
 
-    float4 p_hom_center = transformPoint4x4(center_triangle, projmatrix);
-    float p_w_center = 1.0f / (p_hom_center.w + 0.0000001f);
-    float3 center_triangle_camera_view = { p_hom_center.x * p_w_center, p_hom_center.y * p_w_center, p_hom_center.z * p_w_center };
-    float2 center_triangle_2D = { ndc2Pix(center_triangle_camera_view.x, W), ndc2Pix(center_triangle_camera_view.y, H) };
+
+    float4 p_hom_center = transformPoint4x4(center_triangle, projmatrix);   // triangle center (world) to NDC
+    float p_w_center = 1.0f / (p_hom_center.w + 0.0000001f);    // homogeneous division factor
+    float3 center_triangle_camera_view = { p_hom_center.x * p_w_center, p_hom_center.y * p_w_center, p_hom_center.z * p_w_center }; // center in NDC
+    float2 center_triangle_2D = { ndc2Pix(center_triangle_camera_view.x, W), ndc2Pix(center_triangle_camera_view.y, H) }; // center in pix
 
 
     float distance = 0.0f;
     float distance_points = 0.0f;
 
+    // world to screen for triangle vertices
     for (int i = 0; i < num_points_per_triangle[idx]; i++) {
         float3 triangle_point = {triangles_points[offset + 3 * i], triangles_points[offset + 3 * i + 1], triangles_points[offset + 3 * i + 2]};
         float4 p_hom = transformPoint4x4(triangle_point, projmatrix);
-        p_w[cumsum_for_triangle + i] = 1.0f / (p_hom.w + 0.0000001f);
-        float3 p_proj = { p_hom.x * p_w[cumsum_for_triangle + i], p_hom.y * p_w[cumsum_for_triangle + i], p_hom.z * p_w[cumsum_for_triangle + i] };
-        p_image[cumsum_for_triangle + i] = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+        p_w[cumsum_for_triangle + i] = 1.0f / (p_hom.w + 0.0000001f);   // store homogeneous division factor
+        float3 p_proj = { p_hom.x * p_w[cumsum_for_triangle + i], p_hom.y * p_w[cumsum_for_triangle + i], p_hom.z * p_w[cumsum_for_triangle + i] }; // NDC of vertices
+        p_image[cumsum_for_triangle + i] = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };  // screen coordinates of vertices
 
-        // calculate distance from p_image to center_triangle_2D
-        distance = __fsqrt_rn((p_image[cumsum_for_triangle + i].x - center_triangle_2D.x) * (p_image[cumsum_for_triangle + i].x - center_triangle_2D.x) + (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y) * (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y));
+        // calculate distance from vertex to centroid in screenspace
+        distance = __fsqrt_rn(  (p_image[cumsum_for_triangle + i].x - center_triangle_2D.x) * (p_image[cumsum_for_triangle + i].x - center_triangle_2D.x)+ 
+                                (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y) * (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y));
 
+        // save furthest distance
         if (distance > distance_points) {
             distance_points = distance;
         }
@@ -268,28 +284,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
     incenter.x = (a * A1.x + b * B1.x + c * C1.x) / sum;
     incenter.y = (a * A1.y + b * B1.y + c * C1.y) / sum;
 
-    float max_distance_off = 0.0f;
-    int counter = 0;
-    float max_distance_x = 0.0f;
     float dist = 0.0f;
-
-    float size = 0.0f;
-
-
-    float ratio = stopping_influence / opacities[idx];
-
-    float exponent = 1.0f / sigma[idx];
-
-    uint2 rect_min_triangle_test = { grid.x, grid.y };
-    uint2 rect_max_triangle_test = { 0,       0       };
-
-    float previous_offsets[MAX_NB_POINTS];
 
     for (int i = 0; i < 3; i++) {
         // Points forming the segment
         float2 p1_conv = p_image[cumsum_for_triangle + i];
         float2 p2_conv = p_image[cumsum_for_triangle + (i + 1) % 3];
 
+        // 90deg rotation of line segment p2_conv - p1_conv = [nx, ny]
         float nx = p2_conv.y - p1_conv.y;
         float ny = -(p2_conv.x - p1_conv.x);
         float norm = __fsqrt_rn(nx * nx + ny * ny);
@@ -298,10 +300,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
         // Calculate normalized normal and offset
         float2 normal = {nx * inv_norm, ny * inv_norm};
 
+        // from the normal form of a 2D line:  n dot p + offset = 0 --> -(n dot p) = offset
         float offset = - (normal.x * p1_conv.x + normal.y * p1_conv.y);
 
+        // normal is unit length: n dot p + offset = signed distance perp to line segment
         dist = normal.x * incenter.x + normal.y * incenter.y + offset;
 
+        // incenter is inside the triangle: define inside the triangle to be negative distance
         if (dist > 0) {
             normal.x = -normal.x;
             normal.y = -normal.y;
@@ -309,49 +314,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
             dist = -dist;
         }
 
-        if (size == 0){
-            size = dist * powf(ratio, exponent);
-        }
-
+        // store normals and offsets
         normals[cumsum_for_triangle + i] = normal;
-        offsets[cumsum_for_triangle + i] = offset; 
-
-
-        offset = offset / __fsqrt_rn(normal.x * normal.x + normal.y * normal.y);
-        offset -= size;
-        previous_offsets[i] = offset;
-
-        if (i != 0){
-            float2 previous_normal;
-            previous_normal.x = normals[cumsum_for_triangle + (i-1)].x;
-            previous_normal.y = normals[cumsum_for_triangle + (i-1)].y;
-
-            // Compute determinant
-            float det = normal.x * previous_normal.y - normal.y * previous_normal.x;
-
-            float intersect_x, intersect_y;
-            if (fabsf(det) < 1e-3) {
-                continue;
-            } else {
-                // Calculate intersection point
-                intersect_x = -1*(offset * previous_normal.y - previous_offsets[i-1] * normal.y) / det;
-                intersect_y = -1*(previous_offsets[i-1] * normal.x - offset * previous_normal.x) / det;
-
-                uint bx0 = min(grid.x, max(0, (uint)(intersect_x / BLOCK_X)));
-                uint by0 = min(grid.y, max(0, (uint)(intersect_y / BLOCK_Y)));
-                uint bx1 = min(grid.x, max(0, (uint)((intersect_x + BLOCK_X - 1) / BLOCK_X)));
-                uint by1 = min(grid.y, max(0, (uint)((intersect_y + BLOCK_Y - 1) / BLOCK_Y)));
-
-                rect_min_triangle_test.x = min(rect_min_triangle_test.x, bx0);
-                rect_min_triangle_test.y = min(rect_min_triangle_test.y, by0);
-                rect_max_triangle_test.x = max(rect_max_triangle_test.x, bx1);
-                rect_max_triangle_test.y = max(rect_max_triangle_test.y, by1);
-            }
-        }
-
+        offsets[cumsum_for_triangle + i] = offset;
     }
 
-
+    // distance_points: largest distance vertex to centroid in screen. This 1600 might need to change
+    // dist: distance incenter to edge. -1 indicates the incenter is almost on the edge
     if (distance_points > 1600 or distance_points < 1 or dist > -1) {
         radii[idx] = 0;
         tiles_touched[idx] = 0;
@@ -359,36 +328,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
         return;
     }
 
-    /*####################################################################################################
-    #### Calculations of the final distance                                                             #
-    #####################################################################################################*/
-    float2 normal = normals[cumsum_for_triangle];
-    float offset_ = previous_offsets[0];
+    // left/right extent
+    float pix_min_x = fminf(fminf(A1.x, B1.x), C1.x);
+    float pix_max_x = fmaxf(fmaxf(A1.x, B1.x), C1.x);
+    // top/bottom extent
+    float pix_min_y = fminf(fminf(A1.y, B1.y), C1.y);
+    float pix_max_y = fmaxf(fmaxf(A1.y, B1.y), C1.y);
 
-    float2 previous_normal = normals[cumsum_for_triangle+2];
-    float previous_offset = previous_offsets[2];
-    float det = normal.x * previous_normal.y - normal.y * previous_normal.x;
-
-    float intersect_x, intersect_y;
-    if (fabsf(det) > 1e-3) {
-        // Calculate intersection point
-        intersect_x = -1*(offset_ * previous_normal.y - previous_offset * normal.y) / det;
-        intersect_y = -1*(previous_offset * normal.x - offset_ * previous_normal.x) / det;
-        uint bx0 = min(grid.x, max(0, (uint)(intersect_x / BLOCK_X)));
-        uint by0 = min(grid.y, max(0, (uint)(intersect_y / BLOCK_Y)));
-        uint bx1 = min(grid.x, max(0, (uint)((intersect_x + BLOCK_X - 1) / BLOCK_X)));
-        uint by1 = min(grid.y, max(0, (uint)((intersect_y + BLOCK_Y - 1) / BLOCK_Y)));
-
-        rect_min_triangle_test.x = min(rect_min_triangle_test.x, bx0);
-        rect_min_triangle_test.y = min(rect_min_triangle_test.y, by0);
-        rect_max_triangle_test.x = max(rect_max_triangle_test.x, bx1);
-        rect_max_triangle_test.y = max(rect_max_triangle_test.y, by1);
-    }
+    // bounding box in screen tiles
+    uint2 rect_min_triangle_test;
+    uint2 rect_max_triangle_test;
+    rect_min_triangle_test.x = min(grid.x, max(0, (uint)(pix_min_x / BLOCK_X)));
+    rect_min_triangle_test.y = min(grid.y, max(0, (uint)(pix_min_y / BLOCK_Y)));
+    rect_max_triangle_test.x = min(grid.x, max(0, (uint)((pix_max_x + BLOCK_X - 1) / BLOCK_X)));
+    rect_max_triangle_test.y = min(grid.y, max(0, (uint)((pix_max_y + BLOCK_Y - 1) / BLOCK_Y)));
 
     rect_max[idx] = rect_max_triangle_test;
     rect_min[idx] = rect_min_triangle_test;
 
-
+    // empty bounding box: set values to zero so they can be identified later
     if ((rect_max_triangle_test.x - rect_min_triangle_test.x) * (rect_max_triangle_test.y - rect_min_triangle_test.y) == 0){
         radii[idx] = 0;
         tiles_touched[idx] = 0;
@@ -414,7 +372,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
     }
 
 
-    phi_center[idx] = {1.0f / phi_center_min, size};
+    phi_center[idx] = {1.0f / phi_center_min, 0.0f};
     depths[idx] = p_view_triangle.z; 
     radii[idx] = max_distance;
     points_xy_image[idx] = center_triangle_2D;
