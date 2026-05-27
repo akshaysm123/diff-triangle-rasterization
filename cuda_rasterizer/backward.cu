@@ -457,8 +457,8 @@
 	 const float* __restrict__ colors,
 	 const float* __restrict__ final_Ts,
 	 const uint32_t* __restrict__ n_contrib,
-	 const float* __restrict__ dL_dpixels,
-	 const float* __restrict__ dL_depths,
+	 const float* __restrict__ dL_dpixels, // upstream grad loss wrt rendered pixels RGB
+	 const float* __restrict__ dL_depths, // upstream grad wrt aux outputs
 	 float2* __restrict__ dL_dnormals,
 	 float* __restrict__ dL_doffsets,
 	 float* __restrict__ dL_dsigma,
