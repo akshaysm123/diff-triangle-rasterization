@@ -225,7 +225,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
         normal_cvx.y * normalized_camera_center.y +
         normal_cvx.z * normalized_camera_center.z;
 
-    // 4Flip the normal if needed (ensure it faces the camera)
+    // Flip the normal if needed (ensure it faces the camera)
     if (cos_theta > 0) {
         normal_cvx.x = -normal_cvx.x;
         normal_cvx.y = -normal_cvx.y;
@@ -372,11 +372,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
     }
 
 
-    phi_center[idx] = {1.0f / phi_center_min, 0.0f};
+    phi_center[idx] = {1.0f / phi_center_min, 0.0f}; // [0] = reciprocal of sigend distance to incenter (negative)
     depths[idx] = p_view_triangle.z; 
-    radii[idx] = max_distance;
+    radii[idx] = max_distance; // this is essentially a visibility check for both tile-binning and backward
     points_xy_image[idx] = center_triangle_2D;
-    conic_opacity[idx] = {normal_cvx.x, normal_cvx.y, normal_cvx.z, opacities[idx]};
+    conic_opacity[idx] = {normal_cvx.x, normal_cvx.y, normal_cvx.z, opacities[idx]}; // naming is off, this are normals and opacity
     tiles_touched[idx] = (rect_max_triangle_test.y - rect_min_triangle_test.y) * (rect_max_triangle_test.x - rect_min_triangle_test.x);
 }
 
@@ -408,12 +408,12 @@ renderCUDA(
 {
     // Identify current tile and associated min/max pixel range.
     auto block = cg::this_thread_block();
-    uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-    uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-    uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-    uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-    uint32_t pix_id = W * pix.y + pix.x;
-    float2 pixf = { (float)pix.x, (float)pix.y };
+    uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X; // n.o horizontal blocks
+    uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y }; // min pix values of this block
+    uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) }; // max pixel values of this block (excl)
+    uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y }; // pixel value for this thread
+    uint32_t pix_id = W * pix.y + pix.x; // pixel ID in flattaned list of pixels
+    float2 pixf = { (float)pix.x, (float)pix.y }; // pixel coords as float
 
     // Check if this thread is associated with a valid pixel or outside.
     bool inside = pix.x < W&& pix.y < H;
@@ -421,23 +421,25 @@ renderCUDA(
     bool done = !inside;
 
     // Load start/end range of IDs to process in bit sorted list.
+    // ranges is indexed on tiles, but flattened
     uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+    // ceiling division to determine the number of rounds for fetching data
     const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
     int toDo = range.y - range.x;
 
     // Allocate storage for batches of collectively fetched data.
-    __shared__ int collected_id[BLOCK_SIZE];
-    __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+    __shared__ int collected_id[BLOCK_SIZE]; // id in point list
+    __shared__ float4 collected_conic_opacity[BLOCK_SIZE]; // float4 of .xyz camera space normal, .w opacity
 
     /*
     ADDED FOR TRIANGLE PURPOSES ==========================================================================
     */
-    __shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS];
-    __shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS];
-    __shared__ float collected_sigma[BLOCK_SIZE];
-    __shared__ float collected_depths[BLOCK_SIZE];
-    __shared__ float2 collected_xy[BLOCK_SIZE];
-    __shared__ float2 collected_phi_center[BLOCK_SIZE];
+    __shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS]; // 2d normals of triangle edges
+    __shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS]; // offsets for each edge in the normal form equation
+    __shared__ float collected_sigma[BLOCK_SIZE]; // per triangle sigma
+    __shared__ float collected_depths[BLOCK_SIZE]; // camera space depth
+    __shared__ float2 collected_xy[BLOCK_SIZE]; // 2D pixel position of the triangle centroid
+    __shared__ float2 collected_phi_center[BLOCK_SIZE]; // [0] = reciprocal of sigend distance to incenter (negative)
     /*
     ===================================================================================================
     */
@@ -493,7 +495,7 @@ renderCUDA(
             int j_id = collected_id[j];
             float4 con_o = collected_conic_opacity[j];
             float normal[3] = {con_o.x, con_o.y, con_o.z};
-            float2 phi_center_min = collected_phi_center[j];
+            float2 phi_center_min = collected_phi_center[j]; // .x = reciprocal of sigend distance to incenter (negative)
             float sigma_pre = collected_sigma[j];
             float max_val = -INFINITY;
             int base = j * MAX_NB_POINTS;
@@ -501,30 +503,38 @@ renderCUDA(
 
             for (int k = 0; k < 3; k++) {
                 // Compute the current distance
+                // normal form of edge equation: n dot p + offset = distance
                 float dist = (collected_normals[base + k].x * pixf.x
                     + collected_normals[base + k].y * pixf.y
                     + collected_offsets[base + k]);
 
+                // break out of loop if a pixel is outside the triangle
                 if (dist > 0) {
                     outside = true;
                     break;
                 }
 
+                // maximum distance
                 max_val = fmaxf(max_val, dist);
             }
 
+            // skip the current triangle
             if (outside)
                 continue;
 
+            // from the windowing function: (phi(p) / phi(center))^sigma
             float phi_x = max_val;
-            float phi_final = phi_x * phi_center_min.x;
+            float phi_final = phi_x * phi_center_min.x; // these are both negative: phi_final is positive
             float Cx = fmaxf(0.0f,  __powf(phi_final, sigma_pre));
 
-
+            // falloff * opacity = alpha
             float alpha = min(0.99f, con_o.w * Cx); 
+            // skip nearly invisible triangles
             if (alpha < 1.0f / 255.0f)
                 continue;
+            // transmittance after this triangle
             float test_T = T * (1 - alpha);
+            // stop once all light is consumed
             if (test_T < 0.0001f)
             {
                 done = true;
@@ -535,15 +545,23 @@ renderCUDA(
 
             float blending_weight = alpha * T;
             // Update the maximum blending weight in a thread-safe way
+            // this is a running max of blending weights. This is used to track the importance of triangles
+            // and to then guide pruning. 
             atomicMax(((int*)max_blending) + j_id, *((int*)(&blending_weight)));
 
+            // collected_depths[j] should become a convex combination of depths of the triangle vertices
+            // -> barycentrics
+
+            // distortion
             float A = 1-T;
             float m = far_n / (far_n - near_n) * (1 - near_n / collected_depths[j]);
             distortion += (m * m * A + M2 - 2 * m * M1) * blending_weight;
-            D  += collected_depths[j] * blending_weight;
+            D  += collected_depths[j] * blending_weight; // expected depth
+            // first and second moment for distortion
             M1 += m * blending_weight;
             M2 += m * m * blending_weight;
 
+            // median contributor
             if (T > 0.5) {
                 median_depth = collected_depths[j];
                 median_contributor = contributor;
@@ -551,9 +569,11 @@ renderCUDA(
             // Render normal map
             for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * blending_weight;
 
+            // rgb color
             for (int ch = 0; ch < CHANNELS; ch++)
                 C[ch] += features[j_id * CHANNELS + ch] * alpha * T;
 
+            // randomized color for visualization
             const float3 random_rgb = hsv2rgb(
                 random_hue((uint32_t)j_id),
                 RANDOM_COLOR_SATURATION,
@@ -574,7 +594,7 @@ renderCUDA(
     // rendering data to the frame and auxiliary buffers.
     if (inside)
     {
-        out_others[pix_id + 0 * H * W] = last_contributor;
+        out_others[pix_id + 0 * H * W] = last_contributor; // this gets overwritten as DEPTH_OFFSET=0
         final_T[pix_id] = T;
         n_contrib[pix_id] = last_contributor;
         for (int ch = 0; ch < CHANNELS; ch++)

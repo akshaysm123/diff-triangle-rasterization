@@ -519,6 +519,7 @@
 	 if (inside)
 		 for (int i = 0; i < C; i++)
 			 dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+			// load in upstream gradient of loss wrt RGB output per pixel
 
 
 	float dL_dreg;
@@ -530,13 +531,13 @@
 	float dL_dmax_dweight;
 
 	if (inside) {
-		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
-		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id];
-		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id];
+		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id]; // depth gradient from self-cosistency
+		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id]; // alpha graadient from SC
+		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id]; // distortion gradient
 		for (int i = 0; i < 3; i++) 
-			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
+			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id]; // normal gradient from SC
 
-		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
+		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id]; // straight through grad for median contributor z
 	}
 
 	// for compute gradient with respect to depth and normal
@@ -619,6 +620,7 @@
 			 if (outside)
 				 continue;
  
+			 // same calculation as in the forward kernel
 			 float phi_x = max_val;
 			 float phi_final = phi_x * phi_center_min.x;
 			 float Cx = fmaxf(0.0f,  __powf(phi_final, sigma_pre));
@@ -628,32 +630,38 @@
 			 if (alpha < 1.0f / 255.0f)
 				 continue;
  
+			 // transmittance just before this triangle
 			 T = T / (1.f - alpha);
 			 const float dchannel_dcolor = alpha * T;
  
 			 // Propagate gradients to per-Triangle colors and keep
 			 // gradients w.r.t. alpha (blending factor for a Triangle/pixel
 			 // pair).
-			 float dL_dalpha = 0.0f;
-			 const int global_id = collected_id[j];
+			 float dL_dalpha = 0.0f;	//accumulation of alpha gradient
+			 const int global_id = collected_id[j]; // current index
 			 for (int ch = 0; ch < C; ch++)
 			 {
-				 const float c = collected_colors[ch * BLOCK_SIZE + j];
+				 const float c = collected_colors[ch * BLOCK_SIZE + j]; // color channel value ofthis triangle
 				 // Update last color (to be used in the next iteration)
 				 accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				 last_color[ch] = c;
+				 // accum rec is the composite color behind the current triangle
+				 last_color[ch] = c; // update last color
  
-				 const float dL_dchannel = dL_dpixel[ch];
+				 const float dL_dchannel = dL_dpixel[ch]; // pixel RGB loss wrt specific channel
 				 dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
 				 // Update the gradients w.r.t. color of the Triangle. 
 				 // Atomic, since this pixel is just one of potentially
 				 // many that were affected by this Triangle.
 				 atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				 // this is the gradient of the loss wrt THIS TRIANGLE's color . (per channel still)
 			 }
 
 			 float dL_dz = 0.0f;
 			 float dL_dweight = 0;
  
+			 // collected_depths here is the depth of just the centroid. This should also be changed once
+			 // barycentrics are added. 
+			 // Gradient of loss wrt distortion
 			 const float m_d = far_n / (far_n - near_n) * (1 - near_n / collected_depths[j]);
 			  const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * collected_depths[j] * collected_depths[j]);
 			  if (contributor == median_contributor-1) {
@@ -668,9 +676,12 @@
 			 dL_dz += dL_dmd * dmd_dd;
  
 			 // Propagate gradients w.r.t ray-splat depths
+			 // accumulated depth, again collected_dephts. This section comes from the SC normal loss. However
+			 // its contribution to the depth gradient is later on
 			 accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
 			 last_depth = collected_depths[j];
 			 dL_dalpha += (collected_depths[j] - accum_depth_rec) * dL_ddepth;
+
 			 // Propagate gradients w.r.t. color ray-splat alphas
 			 accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
 			 dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
@@ -694,11 +705,13 @@
 			 dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 			 dL_dz += alpha * T * dL_ddepth; 
-			 atomicAdd(&(dL_dmean2D[global_id].x), dL_dz);
+			 atomicAdd(&(dL_dmean2D[global_id].x), dL_dz); // dL_dmean2D[].x is actually the grad of loss wrt depth/z
  
 			 // Helpful reusable temporary variables
 			 const float dL_dC = con_o.w * dL_dalpha;
 
+			 // grad wrt sigma, but i'll look to make this a non-learnable parameter and schedule it to enforce
+			 // triangles with uniform contribution across their extent.
 			 if (phi_final > 0.0f) {
 				// derivative with respect to sigma
 				float dL_dsigma_value = dL_dC * Cx * __logf(phi_final);
