@@ -487,6 +487,7 @@ renderCUDA(
         block.sync();
 
         // Iterate over current batch
+        // iterate over candidate triangles for the current batch
         for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
         {
             // Keep track of current position in range
