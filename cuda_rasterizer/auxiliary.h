@@ -36,6 +36,9 @@
 #define MIDDEPTH_OFFSET 5
 #define DISTORTION_OFFSET 6
 #define RANDOM_COLOR_OFFSET 7
+// Global id of the surface (median) triangle at each pixel; used to attribute
+// per-pixel depth error back onto triangles for error-aware densification.
+#define SURFACE_ID_OFFSET 10
 
 __device__ const float RANDOM_COLOR_SATURATION = 0.75f;
 __device__ const float RANDOM_COLOR_VALUE = 0.9f;

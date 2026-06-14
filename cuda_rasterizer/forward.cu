@@ -459,6 +459,8 @@ renderCUDA(
     float distortion = {0};
     float median_depth = {0};
     float median_contributor = {-1};
+    // Global id of the triangle that forms the surface (median) at this pixel.
+    int median_j_id = -1;
 
     // Iterate over batches until all done or range is complete
     for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -566,6 +568,7 @@ renderCUDA(
             if (T > 0.5) {
                 median_depth = collected_depths[j];
                 median_contributor = contributor;
+                median_j_id = j_id;
             }
             // Render normal map
             for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * blending_weight;
@@ -611,6 +614,9 @@ renderCUDA(
         out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
         for (int ch = 0; ch < 3; ch++)
             out_others[pix_id + (RANDOM_COLOR_OFFSET + ch) * H * W] = C_random[ch] + T * bg_color[ch];
+        // Surface-triangle id stored as float (exact for ids < 2^24, well above max_shapes).
+        // -1 marks background / empty pixels with no surface.
+        out_others[pix_id + SURFACE_ID_OFFSET * H * W] = (float)median_j_id;
     }
 }
 

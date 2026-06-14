@@ -89,7 +89,8 @@ RasterizetrianglesCUDA(
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
-  torch::Tensor out_others = torch::full({3+3+1+3, H, W}, 0.0, float_opts);
+  // channels: depth(1) + alpha(1) + normal(3) + median_depth(1) + distortion(1) + random_color(3) + surface_id(1)
+  torch::Tensor out_others = torch::full({3+3+1+3+1, H, W}, 0.0, float_opts);
   torch::Tensor max_blending = torch::full({P}, 0.0, float_opts);
 
 
