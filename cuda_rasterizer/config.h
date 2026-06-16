@@ -29,4 +29,13 @@
 
 #define MAX_NB_POINTS 3
 
+// Depth interpolation mode (recompile after changing):
+//   1 = per-pixel barycentric depth (depth varies across the triangle)
+//   0 = constant per-triangle depth (centroid depth, original behavior)
+// In constant mode the barycentric weights are forced to 1/3, which makes the
+// per-pixel depth equal the mean of the vertex depths. Because the view-space z is
+// affine in world position, that mean equals the centroid depth exactly, so this
+// reproduces the original constant-depth forward and backward (the 1/3 gradient split).
+#define DEPTH_BARYCENTRIC 1
+
 #endif

@@ -567,8 +567,9 @@ renderCUDA(
             float2 v2 = collected_vertices[base + 2];
             float bary_det = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y);
             float pixel_depth;
-            if (fabsf(bary_det) < 1e-8f) {
-                // Degenerate projected triangle: fall back to the vertex-depth mean.
+            // Constant-depth mode (DEPTH_BARYCENTRIC == 0) or a degenerate projected
+            // triangle: fall back to the vertex-depth mean, which equals the centroid depth.
+            if (!DEPTH_BARYCENTRIC || fabsf(bary_det) < 1e-8f) {
                 pixel_depth = (collected_vertex_depths[base + 0]
                     + collected_vertex_depths[base + 1]
                     + collected_vertex_depths[base + 2]) * (1.0f / 3.0f);

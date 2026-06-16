@@ -645,8 +645,10 @@ renderCUDA(
             float z2 = collected_vertex_depths[base + 2];
             float bary_det = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y);
             float l0, l1, l2;
-            if (fabsf(bary_det) < 1e-8f) {
-                // Degenerate projected triangle: matches the forward vertex-depth mean.
+            // Constant-depth mode (DEPTH_BARYCENTRIC == 0) or a degenerate projected
+            // triangle: weights of 1/3 reproduce the centroid depth and the original
+            // equal (1/3) split of the depth gradient across the three vertices.
+            if (!DEPTH_BARYCENTRIC || fabsf(bary_det) < 1e-8f) {
                 l0 = l1 = l2 = 1.0f / 3.0f;
             } else {
                 float inv_det = 1.0f / bary_det;
