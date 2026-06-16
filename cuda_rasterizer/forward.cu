@@ -109,6 +109,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
     float* offsets,
     float* p_w,
     float2* p_image,
+    float* vertex_depths,
     int* indices,
     float2* points_xy_image,
     float* depths,
@@ -257,6 +258,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
         float3 p_proj = { p_hom.x * p_w[cumsum_for_triangle + i], p_hom.y * p_w[cumsum_for_triangle + i], p_hom.z * p_w[cumsum_for_triangle + i] }; // NDC of vertices
         p_image[cumsum_for_triangle + i] = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };  // screen coordinates of vertices
 
+        // per-vertex camera-space depth (view-space z), interpolated per-pixel in the render kernel
+        vertex_depths[cumsum_for_triangle + i] = transformPoint4x3(triangle_point, viewmatrix).z;
+
         // calculate distance from vertex to centroid in screenspace
         distance = __fsqrt_rn(  (p_image[cumsum_for_triangle + i].x - center_triangle_2D.x) * (p_image[cumsum_for_triangle + i].x - center_triangle_2D.x)+ 
                                 (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y) * (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y));
@@ -392,12 +396,13 @@ renderCUDA(
     const float2* __restrict__ normals,
     const float* __restrict__ offsets,
     const float2* __restrict__ points_xy_image,
+    const float2* __restrict__ p_image,
+    const float* __restrict__ vertex_depths,
     const float* __restrict__ sigma,
     const int* __restrict__ num_points_per_triangle,
     const int* __restrict__ cumsum_of_points_per_triangle,
     const float* __restrict__ features,
     const float4* __restrict__ conic_opacity,
-    const float* __restrict__ depths,
     const float2* __restrict__ phi_center,
     float* __restrict__ final_T,
     uint32_t* __restrict__ n_contrib,
@@ -436,8 +441,9 @@ renderCUDA(
     */
     __shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS]; // 2d normals of triangle edges
     __shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS]; // offsets for each edge in the normal form equation
+    __shared__ float2 collected_vertices[BLOCK_SIZE * MAX_NB_POINTS]; // 2D screen positions of triangle vertices
+    __shared__ float collected_vertex_depths[BLOCK_SIZE * MAX_NB_POINTS]; // per-vertex camera space depth
     __shared__ float collected_sigma[BLOCK_SIZE]; // per triangle sigma
-    __shared__ float collected_depths[BLOCK_SIZE]; // camera space depth
     __shared__ float2 collected_xy[BLOCK_SIZE]; // 2D pixel position of the triangle centroid
     __shared__ float2 collected_phi_center[BLOCK_SIZE]; // [0] = reciprocal of sigend distance to incenter (negative)
     /*
@@ -478,11 +484,12 @@ renderCUDA(
             collected_id[block.thread_rank()] = coll_id;
             collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
             collected_sigma[block.thread_rank()] = sigma[coll_id];
-            collected_depths[block.thread_rank()] = depths[coll_id];
             collected_xy[block.thread_rank()] = points_xy_image[coll_id];
             for (int k = 0; k < 3; k++) {
                 collected_normals[MAX_NB_POINTS * block.thread_rank() + k] = normals[cumsum_of_points_per_triangle[coll_id] + k];
                 collected_offsets[MAX_NB_POINTS * block.thread_rank() + k] = offsets[cumsum_of_points_per_triangle[coll_id] + k];
+                collected_vertices[MAX_NB_POINTS * block.thread_rank() + k] = p_image[cumsum_of_points_per_triangle[coll_id] + k];
+                collected_vertex_depths[MAX_NB_POINTS * block.thread_rank() + k] = vertex_depths[cumsum_of_points_per_triangle[coll_id] + k];
             }
             collected_phi_center[block.thread_rank()] = phi_center[coll_id];
         }
@@ -552,21 +559,41 @@ renderCUDA(
             // and to then guide pruning. 
             atomicMax(((int*)max_blending) + j_id, *((int*)(&blending_weight)));
 
-            // collected_depths[j] should become a convex combination of depths of the triangle vertices
-            // -> barycentrics
+            // Per-pixel depth as the barycentric interpolation of the vertex depths.
+            // Barycentric coordinates of the current pixel w.r.t. the triangle's
+            // 2D screen-space vertices.
+            float2 v0 = collected_vertices[base + 0];
+            float2 v1 = collected_vertices[base + 1];
+            float2 v2 = collected_vertices[base + 2];
+            float bary_det = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y);
+            float pixel_depth;
+            if (fabsf(bary_det) < 1e-8f) {
+                // Degenerate projected triangle: fall back to the vertex-depth mean.
+                pixel_depth = (collected_vertex_depths[base + 0]
+                    + collected_vertex_depths[base + 1]
+                    + collected_vertex_depths[base + 2]) * (1.0f / 3.0f);
+            } else {
+                float inv_det = 1.0f / bary_det;
+                float l0 = ((v1.y - v2.y) * (pixf.x - v2.x) + (v2.x - v1.x) * (pixf.y - v2.y)) * inv_det;
+                float l1 = ((v2.y - v0.y) * (pixf.x - v2.x) + (v0.x - v2.x) * (pixf.y - v2.y)) * inv_det;
+                float l2 = 1.0f - l0 - l1;
+                pixel_depth = l0 * collected_vertex_depths[base + 0]
+                    + l1 * collected_vertex_depths[base + 1]
+                    + l2 * collected_vertex_depths[base + 2];
+            }
 
             // distortion
             float A = 1-T;
-            float m = far_n / (far_n - near_n) * (1 - near_n / collected_depths[j]);
+            float m = far_n / (far_n - near_n) * (1 - near_n / pixel_depth);
             distortion += (m * m * A + M2 - 2 * m * M1) * blending_weight;
-            D  += collected_depths[j] * blending_weight; // expected depth
+            D  += pixel_depth * blending_weight; // expected depth
             // first and second moment for distortion
             M1 += m * blending_weight;
             M2 += m * m * blending_weight;
 
             // median contributor
             if (T > 0.5) {
-                median_depth = collected_depths[j];
+                median_depth = pixel_depth;
                 median_contributor = contributor;
                 median_j_id = j_id;
             }
@@ -628,12 +655,13 @@ void FORWARD::render(
     const float2* normals,
     const float* offsets,
     const float2* points_xy_image,
+    const float2* p_image,
+    const float* vertex_depths,
     const float* sigma,
     const int* num_points_per_triangle,
     const int* cumsum_of_points_per_triangle,
     const float* colors,
     const float4* conic_opacity,
-    const float* depths,
     const float2* phi_center,
     float* final_T,
     uint32_t* n_contrib,
@@ -649,12 +677,13 @@ void FORWARD::render(
         normals,
         offsets,
         points_xy_image,
+        p_image,
+        vertex_depths,
         sigma,
         num_points_per_triangle,
         cumsum_of_points_per_triangle,
         colors,
         conic_opacity,
-        depths,
         phi_center,
         final_T,
         n_contrib,
@@ -687,6 +716,7 @@ void FORWARD::preprocess(int P, int D, int M,
     float* offsets,
     float* p_w,
     float2* p_image,
+    float* vertex_depths,
     int* indices,
     float2* means2D,
     float* depths,
@@ -723,6 +753,7 @@ void FORWARD::preprocess(int P, int D, int M,
         offsets,
         p_w,
         p_image,
+        vertex_depths,
         indices,
         means2D,
         depths,

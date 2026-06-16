@@ -54,6 +54,7 @@
   
 		 float* p_w;
 		 float2* p_image;
+		 float* vertex_depths;
 		 int* indices;
  
 		 float* offsets;

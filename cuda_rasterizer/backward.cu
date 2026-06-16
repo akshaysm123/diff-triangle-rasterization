@@ -280,17 +280,24 @@ __global__ void preprocessCUDA(
     }
 
 
-    float3 dL_ddepht = {0.0f, 0.0f, dL_dmean2D[idx].x};
-    float3 transposed_dL_ddepth = transformPoint4x3Transpose(dL_ddepht, viewmatrix);
-
+    // Per-vertex depth gradients packed by the render backward kernel into the three
+    // components of dL_dmean2D (x -> vertex 0, y -> vertex 1, z -> vertex 2). With
+    // per-pixel barycentric depth, each vertex receives its own depth gradient (already
+    // weighted by the barycentric coefficients during rendering) instead of an equal
+    // 1/3 share of a single centroid-depth gradient.
+    float dL_dvertex_depth[3] = { dL_dmean2D[idx].x, dL_dmean2D[idx].y, dL_dmean2D[idx].z };
 
     for (int i = 0; i < 3; i++) {
 
+        // d(view-space z_i) / d(vertex_i world position) is the z-row of the view matrix.
+        float3 dL_ddepth_view = {0.0f, 0.0f, dL_dvertex_depth[i]};
+        float3 transposed_dL_ddepth = transformPoint4x3Transpose(dL_ddepth_view, viewmatrix);
+
         float mul1 = (proj[0] * triangles_points[offset + 3 * i] + proj[4] * triangles_points[offset + 3 * i + 1] + proj[8] * triangles_points[offset + 3 * i + 2] + proj[12]) * p_w[cumsum_for_triangle + i] * p_w[cumsum_for_triangle + i];
         float mul2 = (proj[1] * triangles_points[offset + 3 * i] + proj[5] * triangles_points[offset + 3 * i + 1] + proj[9] * triangles_points[offset + 3 * i + 2] + proj[13]) * p_w[cumsum_for_triangle + i] * p_w[cumsum_for_triangle + i];
-        dL_dtriangle[cumsum_for_triangle + i].x = (proj[0] * p_w[cumsum_for_triangle + i] - proj[3] * mul1) * loss_points_x[i]  + (proj[1] * p_w[cumsum_for_triangle + i] - proj[3] * mul2) * loss_points_y[i] + transposed_dL_ddepth.x / 3;
-        dL_dtriangle[cumsum_for_triangle + i].y = (proj[4] * p_w[cumsum_for_triangle + i] - proj[7] * mul1) * loss_points_x[i] + (proj[5] * p_w[cumsum_for_triangle + i] - proj[7] * mul2) * loss_points_y[i] + transposed_dL_ddepth.y / 3;
-        dL_dtriangle[cumsum_for_triangle + i].z = (proj[8] * p_w[cumsum_for_triangle + i] - proj[11] * mul1) * loss_points_x[i] + (proj[9] * p_w[cumsum_for_triangle + i] - proj[11] * mul2) * loss_points_y[i] + transposed_dL_ddepth.z / 3;
+        dL_dtriangle[cumsum_for_triangle + i].x = (proj[0] * p_w[cumsum_for_triangle + i] - proj[3] * mul1) * loss_points_x[i]  + (proj[1] * p_w[cumsum_for_triangle + i] - proj[3] * mul2) * loss_points_y[i] + transposed_dL_ddepth.x;
+        dL_dtriangle[cumsum_for_triangle + i].y = (proj[4] * p_w[cumsum_for_triangle + i] - proj[7] * mul1) * loss_points_x[i] + (proj[5] * p_w[cumsum_for_triangle + i] - proj[7] * mul2) * loss_points_y[i] + transposed_dL_ddepth.y;
+        dL_dtriangle[cumsum_for_triangle + i].z = (proj[8] * p_w[cumsum_for_triangle + i] - proj[11] * mul1) * loss_points_x[i] + (proj[9] * p_w[cumsum_for_triangle + i] - proj[11] * mul2) * loss_points_y[i] + transposed_dL_ddepth.z;
 
     }
 
@@ -457,7 +464,8 @@ renderCUDA(
     const float2* __restrict__ normals,
     const float* __restrict__ offsets,
     const float4* __restrict__ conic_opacity,
-    const float* __restrict__ depths,
+    const float2* __restrict__ p_image,
+    const float* __restrict__ vertex_depths,
     const float2* __restrict__ means2D,
     const float2* __restrict__ phi_center,
     const float* __restrict__ colors,
@@ -501,9 +509,10 @@ renderCUDA(
     */
     __shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS];
     __shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS];
+    __shared__ float2 collected_vertices[BLOCK_SIZE * MAX_NB_POINTS]; // 2D screen positions of triangle vertices
+    __shared__ float collected_vertex_depths[BLOCK_SIZE * MAX_NB_POINTS]; // per-vertex camera space depth
     __shared__ int collected_cumsum_of_points_per_triangle[BLOCK_SIZE];
     __shared__ float collected_sigma[BLOCK_SIZE];
-    __shared__ float collected_depths[BLOCK_SIZE];
     __shared__ float2 collected_xy[BLOCK_SIZE];
     __shared__ float2 collected_phi_center[BLOCK_SIZE];
     /*
@@ -578,11 +587,12 @@ renderCUDA(
                 collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
             collected_cumsum_of_points_per_triangle[block.thread_rank()] = cumsum_of_points_per_triangle[coll_id];
             collected_sigma[block.thread_rank()] = sigma[coll_id];
-            collected_depths[block.thread_rank()] = depths[coll_id];
             collected_xy[block.thread_rank()] = means2D[coll_id];
             for (int k = 0; k < 3; k++) {
                 collected_normals[MAX_NB_POINTS * block.thread_rank() + k] = normals[cumsum_of_points_per_triangle[coll_id] + k];
                 collected_offsets[MAX_NB_POINTS * block.thread_rank() + k] = offsets[cumsum_of_points_per_triangle[coll_id] + k];
+                collected_vertices[MAX_NB_POINTS * block.thread_rank() + k] = p_image[cumsum_of_points_per_triangle[coll_id] + k];
+                collected_vertex_depths[MAX_NB_POINTS * block.thread_rank() + k] = vertex_depths[cumsum_of_points_per_triangle[coll_id] + k];
             }
             collected_phi_center[block.thread_rank()] = phi_center[coll_id];
         }
@@ -601,12 +611,9 @@ renderCUDA(
             float2 phi_center_min = collected_phi_center[j];
             float distances[MAX_NB_POINTS];
             float sigma_pre = collected_sigma[j];
-            float depth = collected_depths[j];
-            float sum_exp = 0.0f;
             float max_val = -INFINITY;
             int base = j * MAX_NB_POINTS;
             bool outside = false;
-            float c_d = collected_depths[j];
 
             for (int k = 0; k < 3; k++) {
                 // Compute the current distance
@@ -625,6 +632,29 @@ renderCUDA(
 
             if (outside)
                 continue;
+
+            // Recompute the forward per-pixel depth: barycentric interpolation of the
+            // three vertex depths, using screen-space barycentric coordinates of this
+            // pixel w.r.t. the projected triangle vertices. l0/l1/l2 are reused below to
+            // distribute the depth gradient back onto the per-vertex depths.
+            float2 v0 = collected_vertices[base + 0];
+            float2 v1 = collected_vertices[base + 1];
+            float2 v2 = collected_vertices[base + 2];
+            float z0 = collected_vertex_depths[base + 0];
+            float z1 = collected_vertex_depths[base + 1];
+            float z2 = collected_vertex_depths[base + 2];
+            float bary_det = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y);
+            float l0, l1, l2;
+            if (fabsf(bary_det) < 1e-8f) {
+                // Degenerate projected triangle: matches the forward vertex-depth mean.
+                l0 = l1 = l2 = 1.0f / 3.0f;
+            } else {
+                float inv_det = 1.0f / bary_det;
+                l0 = ((v1.y - v2.y) * (pixf.x - v2.x) + (v2.x - v1.x) * (pixf.y - v2.y)) * inv_det;
+                l1 = ((v2.y - v0.y) * (pixf.x - v2.x) + (v0.x - v2.x) * (pixf.y - v2.y)) * inv_det;
+                l2 = 1.0f - l0 - l1;
+            }
+            float pixel_depth = l0 * z0 + l1 * z1 + l2 * z2;
 
             // same calculation as in the forward kernel
             float phi_x = max_val;
@@ -662,16 +692,16 @@ renderCUDA(
                 // this is the gradient of the loss wrt THIS TRIANGLE's color . (per channel still)
             }
 
-            float dL_dz = 0.0f;
+            // Gradient of the loss w.r.t. this pixel's interpolated depth. All depth
+            // consumers (distortion, median, expected depth) now act on pixel_depth.
+            float dL_dpixel_depth = 0.0f;
             float dL_dweight = 0;
 
-            // collected_depths here is the depth of just the centroid. This should also be changed once
-            // barycentrics are added. 
             // Gradient of loss wrt distortion
-            const float m_d = far_n / (far_n - near_n) * (1 - near_n / collected_depths[j]);
-            const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * collected_depths[j] * collected_depths[j]);
+            const float m_d = far_n / (far_n - near_n) * (1 - near_n / pixel_depth);
+            const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * pixel_depth * pixel_depth);
             if (contributor == median_contributor-1) {
-                dL_dz += dL_dmedian_depth;
+                dL_dpixel_depth += dL_dmedian_depth;
             }
 
             dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
@@ -679,14 +709,14 @@ renderCUDA(
             // propagate the current weight W_{i} to next weight W_{i-1}
             last_dL_dT = dL_dweight * alpha + (1 - alpha) * last_dL_dT;
             const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
-            dL_dz += dL_dmd * dmd_dd;
+            dL_dpixel_depth += dL_dmd * dmd_dd;
 
             // Propagate gradients w.r.t ray-splat depths
-            // accumulated depth, again collected_dephts. This section comes from the SC normal loss. However
+            // accumulated depth. This section comes from the SC normal loss. However
             // its contribution to the depth gradient is later on
             accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
-            last_depth = collected_depths[j];
-            dL_dalpha += (collected_depths[j] - accum_depth_rec) * dL_ddepth;
+            last_depth = pixel_depth;
+            dL_dalpha += (pixel_depth - accum_depth_rec) * dL_ddepth;
 
             // Propagate gradients w.r.t. color ray-splat alphas
             accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
@@ -710,8 +740,18 @@ renderCUDA(
                 bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
             dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
-            dL_dz += alpha * T * dL_ddepth; 
-            atomicAdd(&(dL_dmean2D[global_id].x), dL_dz); // dL_dmean2D[].x is actually the grad of loss wrt depth/z
+            dL_dpixel_depth += alpha * T * dL_ddepth;
+
+            // pixel_depth = l0*z0 + l1*z1 + l2*z2, so d(pixel_depth)/dz_k = l_k.
+            // Distribute the depth gradient onto the three per-vertex depths. The three
+            // components of dL_dmean2D are repurposed as the per-vertex depth-gradient
+            // accumulators (z0, z1, z2), consumed in the preprocess backward kernel.
+            // NOTE: this is the gradient w.r.t. the vertex depths only; the dependence of
+            // the barycentric weights l_k on the vertices' screen positions is NOT
+            // differentiated here (see notes/per_pixel_triangle_depth.md).
+            atomicAdd(&(dL_dmean2D[global_id].x), l0 * dL_dpixel_depth);
+            atomicAdd(&(dL_dmean2D[global_id].y), l1 * dL_dpixel_depth);
+            atomicAdd(&(dL_dmean2D[global_id].z), l2 * dL_dpixel_depth);
 
             // Helpful reusable temporary variables
             const float dL_dC = con_o.w * dL_dalpha;
@@ -821,7 +861,8 @@ void BACKWARD::render(
     const float2* normals,
     const float* offsets,
     const float4* conic_opacity,
-    const float* depths,
+    const float2* p_image,
+    const float* vertex_depths,
     const float2* means2D,
     const float2* phi_center,
     const float* colors,
@@ -850,7 +891,8 @@ void BACKWARD::render(
         normals,
         offsets,
         conic_opacity,
-        depths,
+        p_image,
+        vertex_depths,
         means2D,
         phi_center,
         colors,

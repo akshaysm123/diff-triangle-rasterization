@@ -191,6 +191,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
     obtain(chunk, geom.scanning_space, geom.scan_size, 128);
     obtain(chunk, geom.point_offsets, P, 128);
     obtain(chunk, geom.p_image, total_nb_points, 128);
+    obtain(chunk, geom.vertex_depths, total_nb_points, 128);
     obtain(chunk, geom.indices, total_nb_points, 128);
     obtain(chunk, geom.offsets, total_nb_points, 128);
     obtain(chunk, geom.normals, total_nb_points, 128);
@@ -304,6 +305,7 @@ int CudaRasterizer::Rasterizer::forward(
         geomState.offsets,
         geomState.p_w,
         geomState.p_image,
+        geomState.vertex_depths,
         geomState.indices,
         geomState.means2D,
         geomState.depths,
@@ -388,12 +390,13 @@ int CudaRasterizer::Rasterizer::forward(
         geomState.normals,
         geomState.offsets,
         geomState.means2D,
+        geomState.p_image,
+        geomState.vertex_depths,
         sigma,
         num_points_per_triangle,
         cumsum_of_points_per_triangle,
         feature_ptr,
         geomState.conic_opacity,
-        geomState.depths,
         geomState.phi_center,
         imgState.accum_alpha,
         imgState.n_contrib,
@@ -478,7 +481,8 @@ void CudaRasterizer::Rasterizer::backward(
         geomState.normals,
         geomState.offsets,
         geomState.conic_opacity,
-        geomState.depths,
+        geomState.p_image,
+        geomState.vertex_depths,
         geomState.means2D,
         geomState.phi_center,
         color_ptr,
