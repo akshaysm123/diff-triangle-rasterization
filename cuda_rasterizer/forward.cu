@@ -467,6 +467,11 @@ renderCUDA(
     float median_contributor = {-1};
     // Global id of the triangle that forms the surface (median) at this pixel.
     int median_j_id = -1;
+    // Depth of the primitive that causes T to cross below 0.05 / 0.95 (unset = 0).
+    float depth_t05 = 0.f;
+    float depth_t95 = 0.f;
+    bool depth_t05_set = false;
+    bool depth_t95_set = false;
 
     // Iterate over batches until all done or range is complete
     for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -592,6 +597,16 @@ renderCUDA(
             M1 += m * blending_weight;
             M2 += m * m * blending_weight;
 
+            // Record the primitive whose absorption first pushes T below each threshold.
+            if (!depth_t95_set && T > 0.95f && test_T <= 0.95f) {
+                depth_t95 = pixel_depth;
+                depth_t95_set = true;
+            }
+            if (!depth_t05_set && T > 0.05f && test_T <= 0.05f) {
+                depth_t05 = pixel_depth;
+                depth_t05_set = true;
+            }
+
             // median contributor
             if (T > 0.5) {
                 median_depth = pixel_depth;
@@ -645,6 +660,8 @@ renderCUDA(
         // Surface-triangle id stored as float (exact for ids < 2^24, well above max_shapes).
         // -1 marks background / empty pixels with no surface.
         out_others[pix_id + SURFACE_ID_OFFSET * H * W] = (float)median_j_id;
+        out_others[pix_id + DEPTH_RANGE_T05_OFFSET * H * W] = depth_t05_set ? depth_t05 : 0.f;
+        out_others[pix_id + DEPTH_RANGE_T95_OFFSET * H * W] = depth_t95_set ? depth_t95 : 0.f;
     }
 }
 

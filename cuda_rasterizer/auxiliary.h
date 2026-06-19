@@ -39,6 +39,9 @@
 // Global id of the surface (median) triangle at each pixel; used to attribute
 // per-pixel depth error back onto triangles for error-aware densification.
 #define SURFACE_ID_OFFSET 10
+// Per-pixel depth where remaining transmittance T first crosses below 0.05 / 0.95.
+#define DEPTH_RANGE_T05_OFFSET 11
+#define DEPTH_RANGE_T95_OFFSET 12
 
 __device__ const float RANDOM_COLOR_SATURATION = 0.75f;
 __device__ const float RANDOM_COLOR_VALUE = 0.9f;
