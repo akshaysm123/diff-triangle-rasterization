@@ -36,6 +36,6 @@
 // per-pixel depth equal the mean of the vertex depths. Because the view-space z is
 // affine in world position, that mean equals the centroid depth exactly, so this
 // reproduces the original constant-depth forward and backward (the 1/3 gradient split).
-#define DEPTH_BARYCENTRIC 1
+#define DEPTH_BARYCENTRIC 0
 
 #endif
