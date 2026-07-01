@@ -187,6 +187,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, triangles_points.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, triangles_points.options());
+  // Phase-2 (term II) per-vertex lateral (screen-space x/y) depth-gradient scratch.
+  // Written by the render backward and consumed by the preprocess backward; only used
+  // when DEPTH_BARYCENTRIC == 2. Internal, not returned to Python.
+  torch::Tensor dL_dvertex2D = torch::zeros({total_nb_points, 2}, triangles_points.options());
   torch::Tensor dL_dcov3D = torch::zeros({P, 6}, triangles_points.options());
   torch::Tensor dL_dnormal3D = torch::zeros({P, 3}, triangles_points.options());
 
@@ -218,6 +222,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dout_others.contiguous().data_ptr<float>(),
 	  dL_dmeans3D.contiguous().data_ptr<float>(),
 	  dL_dmeans2D.contiguous().data_ptr<float>(),
+	  dL_dvertex2D.contiguous().data_ptr<float>(),
 	  dL_dcov3D.contiguous().data_ptr<float>(),
 	  dL_dnormal3D.contiguous().data_ptr<float>(),
 	  dL_dtriangle.contiguous().data_ptr<float>(),

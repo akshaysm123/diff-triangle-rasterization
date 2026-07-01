@@ -186,6 +186,7 @@ __global__ void preprocessCUDA(
     const float* dL_doffsets,
     glm::vec3* dL_dmeans,
     float3* dL_dmean2D,
+    const float2* dL_dvertex2D,
     float* dL_dcov3D,
     float* dL_dnormal3D,
     float* dL_dcolor,
@@ -286,6 +287,18 @@ __global__ void preprocessCUDA(
     // weighted by the barycentric coefficients during rendering) instead of an equal
     // 1/3 share of a single centroid-depth gradient.
     float dL_dvertex_depth[3] = { dL_dmean2D[idx].x, dL_dmean2D[idx].y, dL_dmean2D[idx].z };
+
+#if DEPTH_BARYCENTRIC == 2
+    // Phase 2 (term II): merge the per-vertex lateral (screen-space x/y) depth gradients
+    // accumulated by the render backward into the screen-space position gradient, before
+    // the projection Jacobian below converts loss_points into world-position gradients.
+    // Vertex ordering matches: indices[cumsum + i] == i (see forward preprocess), so
+    // loss_points_{x,y}[i] and dL_dvertex2D[cumsum + i] refer to the same vertex.
+    for (int i = 0; i < 3; i++) {
+        loss_points_x[i] += dL_dvertex2D[cumsum_for_triangle + i].x;
+        loss_points_y[i] += dL_dvertex2D[cumsum_for_triangle + i].y;
+    }
+#endif
 
     for (int i = 0; i < 3; i++) {
 
@@ -477,6 +490,7 @@ renderCUDA(
     float* __restrict__ dL_doffsets,
     float* __restrict__ dL_dsigma,
     float3* __restrict__ dL_dmean2D,
+    float2* __restrict__ dL_dvertex2D,
     float4* __restrict__ dL_dconic2D,
     float* __restrict__ dL_dopacity,
     float* __restrict__ dL_dnormal3D,
@@ -645,6 +659,13 @@ renderCUDA(
             float z2 = collected_vertex_depths[base + 2];
             float bary_det = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y);
             float l0, l1, l2;
+#if DEPTH_BARYCENTRIC == 2
+            // Screen-space slopes of the interpolated-depth plane through the three
+            // (v_i, z_i), i.e. d(pixel_depth)/dx and d(pixel_depth)/dy. Only needed by
+            // the phase-2 (term II) barycentric-weight gradient path below.
+            float dz_dx = 0.0f, dz_dy = 0.0f;
+            bool bary_valid = false;
+#endif
             // Constant-depth mode (DEPTH_BARYCENTRIC == 0) or a degenerate projected
             // triangle: weights of 1/3 reproduce the centroid depth and the original
             // equal (1/3) split of the depth gradient across the three vertices.
@@ -655,6 +676,11 @@ renderCUDA(
                 l0 = ((v1.y - v2.y) * (pixf.x - v2.x) + (v2.x - v1.x) * (pixf.y - v2.y)) * inv_det;
                 l1 = ((v2.y - v0.y) * (pixf.x - v2.x) + (v0.x - v2.x) * (pixf.y - v2.y)) * inv_det;
                 l2 = 1.0f - l0 - l1;
+#if DEPTH_BARYCENTRIC == 2
+                dz_dx = (z0 * (v1.y - v2.y) + z1 * (v2.y - v0.y) + z2 * (v0.y - v1.y)) * inv_det;
+                dz_dy = (z0 * (v2.x - v1.x) + z1 * (v0.x - v2.x) + z2 * (v1.x - v0.x)) * inv_det;
+                bary_valid = true;
+#endif
             }
             float pixel_depth = l0 * z0 + l1 * z1 + l2 * z2;
 
@@ -755,6 +781,29 @@ renderCUDA(
             atomicAdd(&(dL_dmean2D[global_id].y), l1 * dL_dpixel_depth);
             atomicAdd(&(dL_dmean2D[global_id].z), l2 * dL_dpixel_depth);
 
+#if DEPTH_BARYCENTRIC == 2
+            // Phase 2 (term II): the interpolated depth also depends on the vertices'
+            // screen positions through the barycentric weights l_k. Using the
+            // barycentric identities (sum l_k = 1, sum l_k v_k = pixel), one gets the
+            // closed form d(pixel_depth)/d(v_kx) = -l_k * dz_dx and
+            // d(pixel_depth)/d(v_ky) = -l_k * dz_dy, where dz_d{x,y} are the screen-space
+            // slopes of the depth plane. With g = dL/d(pixel_depth), these lateral
+            // per-vertex gradients are accumulated here and merged into the screen-space
+            // position gradient (loss_points) in the preprocess backward kernel. The
+            // weights are O(1/area), so this term is largest for small triangles.
+            if (bary_valid) {
+                const int cumsum_j = collected_cumsum_of_points_per_triangle[j];
+                const float g_lat_x = -dL_dpixel_depth * dz_dx;
+                const float g_lat_y = -dL_dpixel_depth * dz_dy;
+                atomicAdd(&(dL_dvertex2D[cumsum_j + 0].x), l0 * g_lat_x);
+                atomicAdd(&(dL_dvertex2D[cumsum_j + 0].y), l0 * g_lat_y);
+                atomicAdd(&(dL_dvertex2D[cumsum_j + 1].x), l1 * g_lat_x);
+                atomicAdd(&(dL_dvertex2D[cumsum_j + 1].y), l1 * g_lat_y);
+                atomicAdd(&(dL_dvertex2D[cumsum_j + 2].x), l2 * g_lat_x);
+                atomicAdd(&(dL_dvertex2D[cumsum_j + 2].y), l2 * g_lat_y);
+            }
+#endif
+
             // Helpful reusable temporary variables
             const float dL_dC = con_o.w * dL_dalpha;
 
@@ -811,6 +860,7 @@ void BACKWARD::preprocess(
     const float* dL_doffsets,
     glm::vec3* dL_dmean3D,
     float3* dL_dmean2D,
+    const float2* dL_dvertex2D,
     const float* dL_dconic,
     float* dL_dcov3D,
     float* dL_dnormal3D,
@@ -844,6 +894,7 @@ void BACKWARD::preprocess(
         dL_doffsets,
         (glm::vec3*)dL_dmean3D,
         (float3*)dL_dmean2D,
+        dL_dvertex2D,
         dL_dcov3D,
         dL_dnormal3D,
         dL_dcolor,
@@ -876,6 +927,7 @@ void BACKWARD::render(
     float* dL_doffsets,
     float* dL_dsigma,
     float3* dL_dmean2D,
+    float2* dL_dvertex2D,
     float4* dL_dconic2D,
     float* dL_dopacity,
     float* dL_dnormal3D,
@@ -906,6 +958,7 @@ void BACKWARD::render(
         dL_doffsets,
         dL_dsigma,
         dL_dmean2D,
+        dL_dvertex2D,
         dL_dconic2D,
         dL_dopacity,
         dL_dnormal3D,
